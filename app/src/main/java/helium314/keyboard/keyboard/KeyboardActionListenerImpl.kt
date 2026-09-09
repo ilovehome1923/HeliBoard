@@ -269,9 +269,7 @@ class KeyboardActionListenerImpl(private val latinIME: LatinIME, private val inp
     }
 
     override fun onUpWithDeletePointerActive() {
-        if (!connection.hasSelection()) return
-        inputLogic.finishInput()
-        onCodeInput(KeyCode.DELETE, Constants.NOT_A_COORDINATE, Constants.NOT_A_COORDINATE, false)
+        // Leave the text selected after a delete-key swipe instead of deleting it.
     }
 
     override fun resetMetaState() {

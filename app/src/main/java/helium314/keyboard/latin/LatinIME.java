@@ -15,6 +15,7 @@ import android.content.IntentFilter;
 import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.inputmethodservice.InputMethodService;
 import android.media.AudioManager;
 import android.os.Build;
@@ -113,6 +114,7 @@ public class LatinIME extends InputMethodService implements
     private static final boolean TRACE = false;
 
     private static final int EXTENDED_TOUCHABLE_REGION_HEIGHT = 100;
+    private static final int SYSTEM_GESTURE_EXCLUSION_EDGE_WIDTH_DP = 32;
     private static final int PERIOD_FOR_AUDIO_AND_HAPTIC_FEEDBACK_IN_KEY_REPEAT = 2;
     private static final int PENDING_IMS_CALLBACK_DURATION_MILLIS = 800;
     static final long DELAY_WAIT_FOR_DICTIONARY_LOAD_MILLIS = TimeUnit.SECONDS.toMillis(2);
@@ -138,6 +140,7 @@ public class LatinIME extends InputMethodService implements
 
     // TODO: Move these {@link View}s to {@link KeyboardSwitcher}.
     private View mInputView;
+    private boolean mInputWindowShown;
     private InsetsOutlineProvider mInsetsUpdater;
     private SuggestionStripView mSuggestionStripView;
 
@@ -761,6 +764,7 @@ public class LatinIME extends InputMethodService implements
         mInsetsUpdater = ViewOutlineProviderUtilsKt.setInsetsOutlineProvider(view);
         KtxKt.updateSoftInputWindowLayoutParameters(this, mInputView);
         updateSuggestionStripView(view);
+        updateSystemGestureExclusionRects();
     }
 
     public void updateSuggestionStripView(View view) {
@@ -983,9 +987,6 @@ public class LatinIME extends InputMethodService implements
         if (!mHandler.hasPendingResumeSuggestions()) {
             mHandler.cancelUpdateSuggestionStrip();
             setNeutralSuggestionStrip();
-            if (hasSuggestionStripView() && currentSettingsValues.mAutoShowToolbar && !tryShowClipboardSuggestion()) {
-                mSuggestionStripView.setToolbarVisibility(true);
-            }
         }
 
         mainKeyboardView.setMainDictionaryAvailability(mDictionaryFacilitator.hasAtLeastOneInitializedMainDictionary());
@@ -1002,6 +1003,8 @@ public class LatinIME extends InputMethodService implements
     @Override
     public void onWindowShown() {
         super.onWindowShown();
+        mInputWindowShown = true;
+        updateSystemGestureExclusionRects();
         if (isInputViewShown()) {
             if (mInputView != null && Settings.getValues().mIsFloatingKeyboard)
                 FloatingKeyboardUtils.setFloating(mInputView);
@@ -1012,6 +1015,8 @@ public class LatinIME extends InputMethodService implements
 
     @Override
     public void onWindowHidden() {
+        mInputWindowShown = false;
+        updateSystemGestureExclusionRects();
         super.onWindowHidden();
         Log.i(TAG, "onWindowHidden");
         final MainKeyboardView mainKeyboardView = mKeyboardSwitcher.getMainKeyboardView();
@@ -1019,6 +1024,40 @@ public class LatinIME extends InputMethodService implements
             mainKeyboardView.closing();
         }
         clearNavigationBarColor();
+    }
+
+    /**
+     * Keep edge drags on the visible keyboard from being claimed by Android's back gesture.
+     * This API is ignored before Android 10, where gesture navigation is not available.
+     */
+    private void updateSystemGestureExclusionRects() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || mInputView == null) {
+            return;
+        }
+
+        if (!mInputWindowShown) {
+            mInputView.setSystemGestureExclusionRects(new ArrayList<>());
+            return;
+        }
+
+        // The input view may not have been measured yet when onWindowShown is called.
+        mInputView.post(() -> {
+            if (!mInputWindowShown || mInputView == null) {
+                return;
+            }
+            final int width = mInputView.getWidth();
+            final int height = mInputView.getHeight();
+            if (width == 0 || height == 0) {
+                return;
+            }
+            final int edgeWidth = Math.min(width / 2, Math.round(
+                    SYSTEM_GESTURE_EXCLUSION_EDGE_WIDTH_DP
+                            * getResources().getDisplayMetrics().density));
+            final List<Rect> exclusionRects = new ArrayList<>(2);
+            exclusionRects.add(new Rect(0, 0, edgeWidth, height));
+            exclusionRects.add(new Rect(width - edgeWidth, 0, width, height));
+            mInputView.setSystemGestureExclusionRects(exclusionRects);
+        });
     }
 
     void onFinishInputInternal() {
@@ -1067,6 +1106,10 @@ public class LatinIME extends InputMethodService implements
         // view is not displayed we have no means of showing suggestions anyway, and if it is then
         // we want to show suggestions anyway.
         final SettingsValues settingsValues = mSettings.getCurrent();
+        if (isInputViewShown() && hasSuggestionStripView() && settingsValues.mAutoShowToolbar
+                && newSelStart != newSelEnd) {
+            mSuggestionStripView.setToolbarVisibility(true);
+        }
         if (isInputViewShown()
                 && mInputLogic.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd,
                 composingSpanStart, composingSpanEnd, settingsValues)) {
@@ -1502,7 +1545,8 @@ public class LatinIME extends InputMethodService implements
             mSuggestionStripView.setSuggestions(suggestedWords,
                     mRichImm.getCurrentSubtype().isRtlSubtype());
             // Auto hide the toolbar if dictionary suggestions are available
-            if (currentSettingsValues.mAutoHideToolbar && !noSuggestionsFromDictionaries) {
+            if (currentSettingsValues.mAutoHideToolbar && !noSuggestionsFromDictionaries
+                    && !(currentSettingsValues.mAutoShowToolbar && mInputLogic.mConnection.hasSelection())) {
                 mSuggestionStripView.setToolbarVisibility(false);
             }
         }
@@ -1560,7 +1604,7 @@ public class LatinIME extends InputMethodService implements
     // if the "Auto hide toolbar" is enabled. Otherwise, an empty suggestion strip (if prediction
     // is enabled) or punctuation suggestions (if it's disabled) will be set.
     // Then, the toolbar will be shown automatically if the relevant setting is enabled
-    // and there is a selection of text or it's the start of a line.
+    // and there is a selection of text.
     @Override
     public void setNeutralSuggestionStrip() {
         final SettingsValues currentSettings = mSettings.getCurrent();
@@ -1575,10 +1619,7 @@ public class LatinIME extends InputMethodService implements
                 : SuggestedWords.getEmptyInstance();
         setSuggestedWords(neutralSuggestions);
         if (hasSuggestionStripView() && currentSettings.mAutoShowToolbar) {
-            final int codePointBeforeCursor = mInputLogic.mConnection.getCodePointBeforeCursor();
-            if (mInputLogic.mConnection.hasSelection()
-                    || codePointBeforeCursor == Constants.NOT_A_CODE
-                    || codePointBeforeCursor == Constants.CODE_ENTER) {
+            if (mInputLogic.mConnection.hasSelection()) {
                 mSuggestionStripView.setToolbarVisibility(true);
             }
         }
